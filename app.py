@@ -71,9 +71,34 @@ MODEL_OPTIONS = [
 # HELPERS
 # ─────────────────────────────────────────────
 def extract_pdf_text(uploaded_file) -> str:
-    data = uploaded_file.getvalue()
+    if uploaded_file is None:
+        raise ValueError("No file was provided to extract text from.")
+
+    # Streamlit's UploadedFile normally supports getvalue(); fall back to read()
+    # just in case a plain file-like object is passed instead.
+    if hasattr(uploaded_file, "getvalue"):
+        data = uploaded_file.getvalue()
+    elif hasattr(uploaded_file, "read"):
+        data = uploaded_file.read()
+    else:
+        raise ValueError(
+            f"Unsupported file object of type {type(uploaded_file)!r} — expected an uploaded PDF file."
+        )
+
+    if not data:
+        raise ValueError("The uploaded file appears to be empty.")
+
     doc = fitz.open(stream=data, filetype="pdf")
-    return "".join(page.get_text() for page in doc)
+    try:
+        text = "".join(page.get_text() for page in doc)
+    finally:
+        doc.close()
+
+    if not text.strip():
+        raise ValueError(
+            "No extractable text found in this PDF (it may be a scanned/image-only PDF)."
+        )
+    return text
 
 
 def extract_json(raw: str) -> dict:
@@ -225,7 +250,13 @@ if "jd_text" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Setup")
 
-    secret_key = st.secrets.get("OPENROUTER_API_KEY", "") if hasattr(st, "secrets") else ""
+    def _get_secret(key, default=None):
+        try:
+            return st.secrets.get(key, default)
+        except Exception:
+            return default
+
+    secret_key = _get_secret("OPENROUTER_API_KEY", "")
     if secret_key:
         api_key = secret_key
         st.success("API key loaded from secrets ✅")
@@ -235,8 +266,8 @@ with st.sidebar:
                                       "To avoid typing it every time, add it to .streamlit/secrets.toml "
                                       "as OPENROUTER_API_KEY when deploying.")
 
-    default_model_idx = MODEL_OPTIONS.index(st.secrets.get("OPENROUTER_MODEL")) \
-        if hasattr(st, "secrets") and st.secrets.get("OPENROUTER_MODEL") in MODEL_OPTIONS else 0
+    secret_model = _get_secret("OPENROUTER_MODEL")
+    default_model_idx = MODEL_OPTIONS.index(secret_model) if secret_model in MODEL_OPTIONS else 0
     model = st.selectbox("Model", MODEL_OPTIONS, index=default_model_idx)
 
     st.markdown("---")
@@ -252,11 +283,19 @@ with st.sidebar:
 # RUN ANALYSIS
 # ─────────────────────────────────────────────
 if run:
+    if not jd_file or not cv_files:
+        st.error("Please upload both a Job Description PDF and at least one CV PDF, then click Run Analysis again.")
+        st.stop()
+
     client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
     st.session_state.results = []
 
     with st.spinner("Reading job description..."):
-        jd_text = extract_pdf_text(jd_file)
+        try:
+            jd_text = extract_pdf_text(jd_file)
+        except Exception as e:
+            st.error(f"Could not read the Job Description PDF: {e}")
+            st.stop()
         st.session_state.jd_text = jd_text
         try:
             st.session_state.jd_json = normalize_jd(client, model, jd_text)
@@ -268,7 +307,12 @@ if run:
     n = len(cv_files)
     for i, cv_file in enumerate(cv_files):
         progress.progress((i) / n, text=f"Analyzing {cv_file.name}...")
-        cv_text = extract_pdf_text(cv_file)
+
+        try:
+            cv_text = extract_pdf_text(cv_file)
+        except Exception as e:
+            st.warning(f"Skipping {cv_file.name} — could not read this PDF: {e}")
+            continue
 
         try:
             profile = extract_profile(client, model, cv_text)
@@ -295,7 +339,10 @@ if run:
         })
 
     progress.progress(1.0, text="Done!")
-    st.success(f"Analyzed {n} candidate(s).")
+    if not st.session_state.results:
+        st.error("No candidates could be analyzed — please check the uploaded CV files and try again.")
+        st.stop()
+    st.success(f"Analyzed {len(st.session_state.results)} of {n} candidate(s).")
 
 # ─────────────────────────────────────────────
 # MAIN DASHBOARD
