@@ -327,7 +327,14 @@ with tab_overview:
     with col1:
         st.subheader("Ranked Results")
         score_cols = [c for c in df.columns if c not in ("Rank", "Candidate", "Filename")]
-        styled = df.style.background_gradient(subset=score_cols, cmap="RdYlGn", vmin=0, vmax=10)
+
+        def _highlight_score(v):
+            bg, fg = score_color(v)
+            return f"background-color: {bg}; color: {fg}; font-weight: 600;"
+
+        styler = df.style
+        style_fn = styler.map if hasattr(styler, "map") else styler.applymap
+        styled = style_fn(_highlight_score, subset=score_cols)
         st.dataframe(styled, use_container_width=True, height=min(60 + 40 * len(df), 500))
 
         excel_bytes = build_excel(df.drop(columns=["Filename"]))
