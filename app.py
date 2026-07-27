@@ -3,8 +3,10 @@ AI-Powered CV Analyzer — Exponentiq
 -------------------------------------
 Structured, evidence-based candidate screening for HR teams.
 Upload a job description and a batch of CVs; each candidate is scored on
-seven weighted dimensions with a written rationale, ranked, and laid out
-side-by-side against the source CV for a human reviewer to audit.
+seven weighted dimensions with a written rationale plus a one-line AI
+verdict, ranked, and laid out side-by-side against the source CV for a
+human reviewer to audit. A candidate-pool insights view aggregates
+education, discipline, and role data across the whole batch.
 
 Run:
     pip install -r requirements.txt
@@ -65,10 +67,13 @@ DIMENSIONS = [
     "general_assessment",
 ]
 
+# NOTE: degree_level / discipline were added so the pool-level insight
+# charts (Degree Level pie, Discipline donut) have something to aggregate.
 CANDIDATE_STRUCTURE = {
     "full_name": "", "email": "", "phone": "", "location": "",
     "latest_qualification": "", "last_school_or_university": "",
-    "graduation_year": "", "latest_job_title": "", "latest_employer": "",
+    "graduation_year": "", "degree_level": "", "discipline": "",
+    "latest_job_title": "", "latest_employer": "",
     "latest_job_duration": "", "years_of_experience": "",
     "top_skills": [], "certifications": [], "languages": [], "systems_known": [],
 }
@@ -84,8 +89,12 @@ POSITION_STRUCTURE = {
     },
 }
 
+# overall_assessment is the single-sentence AI verdict shown in the ranked
+# table and at the top of the candidate detail page (the "AI Assessment"
+# column HR teams scan first).
 EVALUATION_STRUCTURE = {
-    "dimensions": [{"name": d, "value": 0, "reasoning": ""} for d in DIMENSIONS]
+    "overall_assessment": "",
+    "dimensions": [{"name": d, "value": 0, "reasoning": ""} for d in DIMENSIONS],
 }
 
 
@@ -159,6 +168,19 @@ def inject_css():
         font-size: 0.78rem; font-weight: 600; color: {INK};
         text-transform: uppercase; letter-spacing: 0.6px;
         margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid {LINE};
+    }}
+
+    /* ---- AI verdict banner (candidate detail) ---- */
+    .eq-verdict {{
+        background: {PAPER}; border: 1px solid {LINE}; border-left: 4px solid {TEAL};
+        border-radius: 8px; padding: 14px 18px; margin: 12px 0 18px 0;
+    }}
+    .eq-verdict-label {{
+        font-size: 0.68rem; color: {TEAL}; text-transform: uppercase;
+        letter-spacing: 0.8px; font-weight: 700; margin-bottom: 5px;
+    }}
+    .eq-verdict-text {{
+        font-size: 0.93rem; color: {INK}; line-height: 1.5;
     }}
 
     /* ---- score ledger card (right panel) ---- */
@@ -257,8 +279,15 @@ def safe_float(v, default=0.0):
 
 
 def fmt_score(v):
-    v = safe_float(v)
-    return f"{v:g}"
+    v = round(safe_float(v), 2)
+    return f"{v:.2f}".rstrip("0").rstrip(".") if "." in f"{v:.2f}" else f"{v:.2f}"
+
+
+def clean_text(v, default="—"):
+    if v is None:
+        return default
+    v = str(v).strip()
+    return v if v and v.lower() not in ("none", "n/a", "na", "null") else default
 
 
 # ─────────────────────────────────────────────
@@ -329,7 +358,9 @@ def normalize_jd(client, model, jd_text):
 def extract_profile(client, model, cv_text):
     raw = call_llm(
         client, model,
-        "You are a CV parser. Extract candidate information into structured JSON. Return ONLY valid JSON, no explanation.",
+        "You are a CV parser. Extract candidate information into structured JSON. Return ONLY valid JSON, no explanation. "
+        "For degree_level use a short normalized label such as 'High School', 'Diploma', 'Bachelors', 'Masters', or 'PhD'. "
+        "For discipline use a short normalized field of study such as 'Computer Science', 'Business Administration', 'Electrical Engineering', etc.",
         f"Extract candidate details from this CV using exactly this JSON structure:\n\n{json.dumps(CANDIDATE_STRUCTURE, indent=2)}\n\nCV:\n{cv_text}",
     )
     return extract_json(raw)
@@ -339,7 +370,10 @@ def evaluate_cv(client, model, structured_jd, cv_text):
     raw = call_llm(
         client, model,
         "You are a professional recruiter. Evaluate candidates against job descriptions strictly and honestly. "
-        "Scores must be plain numbers from 0 to 10 (not strings like '8/10'). Return ONLY valid JSON, no explanation.",
+        "Scores must be plain numbers from 0 to 10 (not strings like '8/10'). "
+        "overall_assessment must be ONE concise sentence (max ~30 words) giving your bottom-line hiring verdict on this "
+        "candidate for this specific role — the kind of one-liner a recruiter would scan first. "
+        "Return ONLY valid JSON, no explanation.",
         f"""Evaluate this candidate's CV against the job description.
 Use this exact JSON structure (scores are plain numbers 0-10):
 {json.dumps(EVALUATION_STRUCTURE, indent=2)}
@@ -400,7 +434,14 @@ def build_excel(results_df: pd.DataFrame) -> bytes:
         for cell in ws[1]:
             cell.fill, cell.font, cell.alignment, cell.border = header_fill, header_font, center_align, thin_border
 
-        score_cols = [c for c in results_df.columns if c.endswith("_score")]
+        score_cols = [c for c in results_df.columns if c.endswith("_score") or c in
+                      ("Overall Score",) or c.replace(" ", "_").lower() in
+                      [d for d in DIMENSIONS]]
+        # also catch the Title Case dimension columns
+        score_cols = list(set(score_cols) | {
+            c for c in results_df.columns
+            if c.replace(" ", "_").lower() in DIMENSIONS or c == "Overall Score"
+        })
         score_col_idx = [results_df.columns.get_loc(c) + 1 for c in score_cols]
 
         tier_fills = {
@@ -415,6 +456,8 @@ def build_excel(results_df: pd.DataFrame) -> bytes:
                 cell.border = thin_border
                 if cell.column in score_col_idx:
                     v = safe_float(cell.value)
+                    cell.value = round(v, 2)
+                    cell.number_format = "0.00"
                     if v >= 7:
                         cell.fill = tier_fills["green"]
                     elif v >= 4:
@@ -526,6 +569,7 @@ if run:
         dims = {d["name"]: d for d in eval_data.get("dimensions", [])}
         scores = [safe_float(dims.get(d, {}).get("value", 0)) for d in DIMENSIONS]
         overall = round(sum(scores) / len(scores), 2) if scores else 0.0
+        overall_assessment = clean_text(eval_data.get("overall_assessment"), default="No AI summary was returned for this candidate.")
 
         st.session_state.results.append({
             "filename": cv_file.name,
@@ -533,6 +577,7 @@ if run:
             "profile": profile,
             "dimensions": dims,
             "overall_score": overall,
+            "overall_assessment": overall_assessment,
         })
 
     progress.progress(1.0, text="Done")
@@ -566,10 +611,11 @@ for r in results:
     row = {
         "Candidate": r["profile"].get("full_name") or r["filename"],
         "Filename": r["filename"],
-        "Overall Score": safe_float(r["overall_score"]),
+        "Overall Score": round(safe_float(r["overall_score"]), 2),
+        "AI Assessment": r.get("overall_assessment", ""),
     }
     for d in DIMENSIONS:
-        row[d.replace("_", " ").title()] = safe_float(r["dimensions"].get(d, {}).get("value", 0))
+        row[d.replace("_", " ").title()] = round(safe_float(r["dimensions"].get(d, {}).get("value", 0)), 2)
     df_rows.append(row)
 
 df = pd.DataFrame(df_rows).sort_values("Overall Score", ascending=False).reset_index(drop=True)
@@ -578,7 +624,7 @@ df.insert(0, "Rank", df.index + 1)
 # ─────────────────────────────────────────────
 # KPI STRIP
 # ─────────────────────────────────────────────
-avg_score = round(df["Overall Score"].mean(), 1)
+avg_score = round(df["Overall Score"].mean(), 2)
 top_row = df.iloc[0]
 strong_matches = int((df["Overall Score"] >= 7).sum())
 
@@ -599,39 +645,48 @@ for col, label, value, sub in [
         """, unsafe_allow_html=True)
 
 st.write("")
-tab_overview, tab_detail = st.tabs(["Overview", "Candidate detail"])
+tab_overview, tab_insights, tab_detail = st.tabs(["Overview", "Candidate pool insights", "Candidate detail"])
 
 # ---------- OVERVIEW TAB ----------
 with tab_overview:
-    col1, col2 = st.columns([1.3, 1])
+    st.markdown('<div class="eq-section-label">Ranked results</div>', unsafe_allow_html=True)
+    score_cols = [c for c in df.columns if c not in ("Rank", "Candidate", "Filename", "AI Assessment")]
 
+    def _highlight_score(v):
+        fg, bg = score_tier(v)
+        return f"background-color: {bg}; color: {fg}; font-weight: 600;"
+
+    table_cols = ["Rank", "Candidate", "AI Assessment", "Overall Score"] + \
+                 [d.replace("_", " ").title() for d in DIMENSIONS]
+    table_df = df[table_cols]
+
+    try:
+        styler = table_df.style
+        style_fn = styler.map if hasattr(styler, "map") else styler.applymap
+        styled = style_fn(_highlight_score, subset=score_cols)
+        styled = styled.format({c: "{:.2f}" for c in score_cols})
+        st.dataframe(
+            styled, width='stretch', height=min(70 + 44 * len(df), 560),
+            column_config={
+                "AI Assessment": st.column_config.TextColumn("AI Assessment", width="large"),
+            },
+        )
+    except Exception:
+        st.dataframe(table_df, width='stretch', height=min(70 + 44 * len(df), 560))
+
+    excel_bytes = build_excel(df.drop(columns=["Filename"]))
+    st.download_button("Download Excel report", data=excel_bytes,
+                        file_name="CV_Evaluation_Results.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    col1, col2 = st.columns([1.2, 1])
     with col1:
-        st.markdown('<div class="eq-section-label">Ranked results</div>', unsafe_allow_html=True)
-        score_cols = [c for c in df.columns if c not in ("Rank", "Candidate", "Filename")]
-
-        def _highlight_score(v):
-            fg, bg = score_tier(v)
-            return f"background-color: {bg}; color: {fg}; font-weight: 600;"
-
-        try:
-            styler = df.style
-            style_fn = styler.map if hasattr(styler, "map") else styler.applymap
-            styled = style_fn(_highlight_score, subset=score_cols)
-            st.dataframe(styled, width='stretch', height=min(60 + 40 * len(df), 500))
-        except Exception:
-            st.dataframe(df, width='stretch', height=min(60 + 40 * len(df), 500))
-
-        excel_bytes = build_excel(df.drop(columns=["Filename"]))
-        st.download_button("Download Excel report", data=excel_bytes,
-                            file_name="CV_Evaluation_Results.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    with col2:
-        st.markdown('<div class="eq-section-label">Overall score by candidate</div>', unsafe_allow_html=True)
+        st.markdown('<div class="eq-section-label" style="margin-top:14px;">Overall score by candidate</div>', unsafe_allow_html=True)
         try:
             fig_bar = px.bar(df, x="Overall Score", y="Candidate", orientation="h",
                               color="Overall Score", color_continuous_scale=SCORE_COLORSCALE,
                               range_color=[0, 10])
+            fig_bar.update_traces(texttemplate="%{x:.2f}", textposition="outside")
             fig_bar.update_layout(
                 yaxis={"categoryorder": "total ascending"}, height=400,
                 plot_bgcolor=PAPER, paper_bgcolor=PAPER,
@@ -642,22 +697,96 @@ with tab_overview:
         except Exception as e:
             st.warning(f"Could not render the score chart: {e}")
 
-    st.markdown('<div class="eq-section-label" style="margin-top:14px;">Dimension breakdown across candidates</div>',
-                unsafe_allow_html=True)
-    try:
-        dim_cols = [d.replace("_", " ").title() for d in DIMENSIONS]
-        heat_df = df.set_index("Candidate")[dim_cols]
-        fig_heat = px.imshow(heat_df, text_auto=True, aspect="auto",
-                              color_continuous_scale=SCORE_COLORSCALE, zmin=0, zmax=10)
-        fig_heat.update_layout(
-            height=120 + 40 * len(df),
-            plot_bgcolor=PAPER, paper_bgcolor=PAPER,
-            font=dict(family="Inter, sans-serif", color=INK),
-            margin=dict(l=0, r=10, t=10, b=10),
-        )
-        st.plotly_chart(fig_heat, width='stretch')
-    except Exception as e:
-        st.warning(f"Could not render the dimension breakdown: {e}")
+    with col2:
+        st.markdown('<div class="eq-section-label" style="margin-top:14px;">Dimension breakdown across candidates</div>', unsafe_allow_html=True)
+        try:
+            dim_cols = [d.replace("_", " ").title() for d in DIMENSIONS]
+            heat_df = df.set_index("Candidate")[dim_cols]
+            fig_heat = px.imshow(heat_df, text_auto=".2f", aspect="auto",
+                                  color_continuous_scale=SCORE_COLORSCALE, zmin=0, zmax=10)
+            fig_heat.update_layout(
+                height=120 + 40 * len(df),
+                plot_bgcolor=PAPER, paper_bgcolor=PAPER,
+                font=dict(family="Inter, sans-serif", color=INK),
+                margin=dict(l=0, r=10, t=10, b=10),
+            )
+            st.plotly_chart(fig_heat, width='stretch')
+        except Exception as e:
+            st.warning(f"Could not render the dimension breakdown: {e}")
+
+# ---------- CANDIDATE POOL INSIGHTS TAB ----------
+with tab_insights:
+    st.markdown('<div class="eq-section-label">Candidate pool composition</div>', unsafe_allow_html=True)
+
+    pool_rows = []
+    for r in results:
+        p = r["profile"]
+        pool_rows.append({
+            "Candidate": p.get("full_name") or r["filename"],
+            "Last School / University": clean_text(p.get("last_school_or_university")),
+            "Latest Job Title": clean_text(p.get("latest_job_title")),
+            "Degree Level": clean_text(p.get("degree_level")),
+            "Discipline": clean_text(p.get("discipline")),
+            "Years of Experience": p.get("years_of_experience"),
+        })
+    pool_df = pd.DataFrame(pool_rows)
+
+    ic1, ic2 = st.columns(2)
+    with ic1:
+        st.markdown("**Last school / university attended**")
+        try:
+            school_counts = pool_df["Last School / University"].value_counts().reset_index()
+            school_counts.columns = ["School", "Count"]
+            fig_school = px.bar(school_counts, x="School", y="Count", color_discrete_sequence=[TEAL])
+            fig_school.update_layout(height=320, plot_bgcolor=PAPER, paper_bgcolor=PAPER,
+                                      font=dict(family="Inter, sans-serif", color=INK),
+                                      margin=dict(l=0, r=10, t=10, b=10))
+            st.plotly_chart(fig_school, width='stretch')
+        except Exception as e:
+            st.warning(f"Could not render this chart: {e}")
+
+    with ic2:
+        st.markdown("**Latest job title**")
+        try:
+            title_counts = pool_df["Latest Job Title"].value_counts().reset_index()
+            title_counts.columns = ["Title", "Count"]
+            fig_title = px.treemap(title_counts, path=["Title"], values="Count",
+                                    color="Count", color_continuous_scale=[FOG, TEAL])
+            fig_title.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=10),
+                                     font=dict(family="Inter, sans-serif", color=INK))
+            st.plotly_chart(fig_title, width='stretch')
+        except Exception as e:
+            st.warning(f"Could not render this chart: {e}")
+
+    ic3, ic4 = st.columns(2)
+    with ic3:
+        st.markdown("**Degree level**")
+        try:
+            deg_counts = pool_df["Degree Level"].value_counts().reset_index()
+            deg_counts.columns = ["Degree Level", "Count"]
+            fig_deg = px.pie(deg_counts, names="Degree Level", values="Count",
+                              color_discrete_sequence=px.colors.sequential.Teal)
+            fig_deg.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=10),
+                                   font=dict(family="Inter, sans-serif", color=INK))
+            st.plotly_chart(fig_deg, width='stretch')
+        except Exception as e:
+            st.warning(f"Could not render this chart: {e}")
+
+    with ic4:
+        st.markdown("**Discipline**")
+        try:
+            disc_counts = pool_df["Discipline"].value_counts().reset_index()
+            disc_counts.columns = ["Discipline", "Count"]
+            fig_disc = px.pie(disc_counts, names="Discipline", values="Count", hole=0.55,
+                               color_discrete_sequence=px.colors.sequential.Teal)
+            fig_disc.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=10),
+                                    font=dict(family="Inter, sans-serif", color=INK))
+            st.plotly_chart(fig_disc, width='stretch')
+        except Exception as e:
+            st.warning(f"Could not render this chart: {e}")
+
+    st.markdown('<div class="eq-section-label" style="margin-top:14px;">Candidate pool detail</div>', unsafe_allow_html=True)
+    st.dataframe(pool_df, width='stretch', height=min(70 + 40 * len(pool_df), 420))
 
 # ---------- DETAIL TAB ----------
 with tab_detail:
@@ -680,11 +809,18 @@ with tab_detail:
         </div>
         """, unsafe_allow_html=True)
 
+    st.markdown(f"""
+    <div class="eq-verdict">
+        <div class="eq-verdict-label">AI Assessment</div>
+        <div class="eq-verdict-text">{candidate.get("overall_assessment", "No AI summary was returned for this candidate.")}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Email", profile.get("email") or "—")
-    c2.metric("Location", profile.get("location") or "—")
-    c3.metric("Latest role", profile.get("latest_job_title") or "—")
-    c4.metric("Experience", str(profile.get("years_of_experience") or "—"))
+    c1.metric("Email", clean_text(profile.get("email")))
+    c2.metric("Location", clean_text(profile.get("location")))
+    c3.metric("Latest role", clean_text(profile.get("latest_job_title")))
+    c4.metric("Experience", clean_text(profile.get("years_of_experience")))
 
     try:
         radar_vals = [safe_float(dims.get(d, {}).get("value", 0)) for d in DIMENSIONS]
